@@ -1,0 +1,349 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <title>Transcription Assistant</title>
+  <script src="https://unpkg.com/wavesurfer.js"></script>
+  <style>
+    body { font-family: Inter, Roboto, Arial, sans-serif; margin: 20px; }
+    .header { display:flex; gap:20px; align-items:center; }
+    .metrics { margin-left: auto; }
+    #waveform { width: 100%; height: 128px; background: #222; margin-top: 10px; }
+    .controls { margin-top: 10px; }
+    .progress { width: 100%; background:#eee; height: 12px; border-radius:6px; overflow:hidden; }
+    .progress > div { height: 100%; background: #2b8aef; width:0%; }
+    textarea { font-family: monospace; white-space: pre-wrap; }
+    button, input[type="file"], input[type="text"] { margin-right: 8px; }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <h2>Transcription Assistant</h2>
+    <div class="metrics" id="metrics">Loading metrics...</div>
+  </div>
+
+  <!-- Controls: Upload, Denoise, Load, Transcribe -->
+  <div>
+    <input id="file" type="file" accept="audio/*"/>
+    <button id="upload">Upload</button>
+    <button id="denoise">Denoise &amp; Enhance</button>
+    <button id="load-denoised" disabled>Load Denoised</button>
+    <button id="load-raw" disabled>Load Raw Upload</button>
+    <label style="margin-left:12px;">
+      <input id="use-denoise" type="checkbox" /> Use Denoise for Transcription?
+    </label>
+    <button id="transcribe" disabled>Transcribe</button>
+    <button id="download" disabled>Download Transcript</button>
+    <a id="download_link" href="#" style="margin-left:10px; display:none;" download>Transcript file</a>
+    <button id="reload-model">Reload Model</button>
+    <input id="switch-model" type="text" placeholder="model name (optional)"/>
+    <button id="switch-model-btn">Switch Model</button>
+    <div id="status" style="display:inline-block; margin-left:10px;">idle</div>
+  </div>
+
+  <div id="waveform"></div>
+
+  <div class="controls">
+    <button id="play">Play</button>
+    <button id="pause">Pause</button>
+    <button id="stop">Stop</button>
+  </div>
+
+  <div style="margin-top:10px">
+    <div class="progress"><div id="progressbar"></div></div>
+    <pre id="log" style="height:200px; overflow:auto; background:#111; color:#ddd; padding:10px;"></pre>
+  </div>
+
+  <!-- Transcript text area (hidden until transcript available) -->
+  <div style="margin-top:10px; display:none;" id="transcript_container">
+    <label for="transcript_text">Transcript (copyable):</label><br/>
+    <textarea id="transcript_text" style="width:100%; height:220px;"></textarea>
+  </div>
+
+  <!-- Text-to-Speech UI -->
+  <div id="tts_ui" style="margin-top:20px; border-top:1px solid #ccc; padding-top:12px;">
+    <h3>Text → Speech</h3>
+    <textarea id="tts_text" placeholder="Enter text to synthesize..." style="width:100%; height:100px;">Hello. This is Izzy. Read me a line of your story and I'll say it back.</textarea>
+    <div style="margin-top:8px;">
+      <input id="tts_model" type="text" placeholder="model (optional)" style="width:300px;" />
+      <button id="tts_synthesize">Synthesize</button>
+      <button id="tts_play" disabled>Play</button>
+      <a id="tts_download" href="#" style="margin-left:8px; display:none;">Download WAV</a>
+      <span id="tts_status" style="margin-left:12px; color:#666;"></span>
+    </div>
+    <audio id="tts_audio" controls style="display:block; margin-top:8px; width:100%;"></audio>
+  </div>
+
+<script>
+const API = {
+  upload: '/upload',
+  transcribe: '/transcribe',
+  status: (id)=>'/status/'+id,
+  events: (id)=>'/events/'+id,
+  download: (id)=>'/download/'+id,
+  reload: '/admin/reload',
+  switch_model: '/admin/switch_model',
+  metrics: '/metrics'
+};
+
+// Top-level globals
+let es = null;
+let currentFile = null;
+let currentFileUrl = null;
+let currentJob = null;
+let wavesurfer = null;
+
+window.addEventListener('DOMContentLoaded', ()=>{
+
+  // initialize wavesurfer
+  try {
+    wavesurfer = WaveSurfer.create({container:'#waveform', waveColor:'#97b', progressColor:'#2b8aef', height: 120});
+  } catch (e) {
+    console.warn('WaveSurfer init failed', e);
+  }
+
+  // element references
+  const statusEl = document.getElementById('status');
+  const loadDenoisedBtn = document.getElementById('load-denoised');
+  const loadRawBtn = document.getElementById('load-raw');
+  const transcribeBtn = document.getElementById('transcribe');
+  const uploadBtn = document.getElementById('upload');
+  const denoiseBtn = document.getElementById('denoise');
+  const progressBar = document.getElementById('progressbar');
+  const logEl = document.getElementById('log');
+
+  // helpers
+  async function refreshMetrics(){
+    try {
+      let r = await fetch(API.metrics);
+      if (!r.ok) { document.getElementById('metrics').innerText = 'Metrics: N/A'; return; }
+      let j = await r.json();
+      document.getElementById('metrics').innerText = 'Jobs: ' + j.jobs_created + ' | Done: ' + j.jobs_completed + ' | Failed: ' + j.jobs_failed;
+    } catch(e){
+      console.error(e);
+    }
+  }
+
+  // SSE listener
+  async function listenEvents(job_id){
+    try { if (es) { es.close(); } } catch(_) {}
+    es = new EventSource(API.events(job_id));
+    es.onmessage = function(ev){ /* generic messages if any */ };
+
+    es.addEventListener('status', function(e){
+      const data = JSON.parse(e.data);
+      if (logEl) logEl.textContent += 'STATUS: '+ JSON.stringify(data) + '\n';
+      refreshMetrics();
+    });
+
+    es.addEventListener('progress', function(e){
+      const data = JSON.parse(e.data);
+      if (progressBar) progressBar.style.width = data.progress + '%';
+      if (logEl) logEl.textContent += 'PROGRESS: '+ JSON.stringify(data) + '\n';
+      // auto-load denoised once a threshold is reached
+      if (data.progress >= 50 && currentJob) {
+        fetch(`/denoise/job/${currentJob}`, { method: 'HEAD' }).then(r => {
+          if (r.ok) {
+            try { wavesurfer.load(`/denoise/job/${currentJob}`); if (statusEl) statusEl.innerText = 'Denoised loaded (auto)'; } catch(_) {}
+          }
+        }).catch(()=>{/* ignore */});
+      }
+    });
+
+    es.addEventListener('done', function(e){
+      const data = JSON.parse(e.data);
+      const filename = data.filename || (data.result_path ? (data.result_path.split('/').pop()) : null);
+      const link = document.getElementById('download_link');
+      if (link) {
+        link.href = API.download(job_id);
+        if (filename) {
+          link.textContent = filename;
+          link.style.display = 'inline-block';
+          link.setAttribute('download', filename);
+        } else {
+          link.textContent = 'download transcript';
+          link.style.display = 'inline-block';
+        }
+      }
+      const dlBtn = document.getElementById('download');
+      if (dlBtn) dlBtn.disabled = false;
+      if (statusEl) statusEl.innerText = 'done: ' + (filename || data.result_path || '');
+      // fetch transcript text into textarea
+      fetch(API.download(job_id))
+        .then(resp => { if(!resp.ok) throw new Error('Failed'); return resp.text(); })
+        .then(text => {
+          const container = document.getElementById('transcript_container');
+          const ta = document.getElementById('transcript_text');
+          if (ta) ta.value = text;
+          if (container) container.style.display = 'block';
+        }).catch(err => console.warn('Could not fetch transcript text:', err));
+      refreshMetrics();
+      try { es.close(); } catch(_) {}
+    });
+
+    es.addEventListener('error', function(e){
+      try {
+        const data = JSON.parse(e.data || '{}');
+        if (statusEl) statusEl.innerText = 'error: ' + (data.error || 'unknown');
+        if (logEl) logEl.textContent += 'ERROR: '+ JSON.stringify(data) + '\n';
+      } catch(_) {}
+      try { es.close(); } catch(_) {}
+    });
+  }
+
+  // File selection
+  const fileInput = document.getElementById('file');
+  fileInput.addEventListener('change', (ev)=>{
+    const f = ev.target.files[0];
+    if(!f) return;
+    currentFile = f;
+    if (currentFileUrl) { URL.revokeObjectURL(currentFileUrl); currentFileUrl = null; }
+    currentFileUrl = URL.createObjectURL(f);
+    try { if (wavesurfer) wavesurfer.load(currentFileUrl); } catch(e){ console.warn('wavesurfer load failed', e); }
+    transcribeBtn.disabled = false;
+    loadRawBtn.disabled = false;
+    if (statusEl) statusEl.innerText = 'file selected: ' + f.name;
+  });
+
+  // Upload handler
+  uploadBtn.addEventListener('click', async ()=>{
+    if(!currentFile){ alert('Choose a file first'); return; }
+    const fd = new FormData();
+    fd.append('file', currentFile);
+    if (statusEl) statusEl.innerText = 'uploading...';
+    const resp = await fetch(API.upload, {method:'POST', body:fd});
+    if(!resp.ok){ alert('Upload failed: '+resp.statusText); return; }
+    const job = await resp.json();
+    if (statusEl) statusEl.innerText = 'uploaded; job_id: '+job.job_id;
+    currentJob = job.job_id;
+    listenEvents(currentJob);
+    loadDenoisedBtn.disabled = false;
+    loadRawBtn.disabled = false;
+    transcribeBtn.disabled = false;
+  });
+
+  // Denoise handler (separate flow)
+  denoiseBtn.addEventListener('click', async ()=>{
+    if(!currentFile){ alert('Choose a file first'); return; }
+    const fd = new FormData();
+    fd.append('file', currentFile);
+    if (statusEl) statusEl.innerText = 'denoising...';
+    try {
+      const resp = await fetch('/denoise', { method: 'POST', body: fd });
+      if(!resp.ok) throw new Error('denoise failed: '+resp.status);
+      const j = await resp.json();
+      if (statusEl) statusEl.innerText = 'denoise complete: ' + j.filename;
+      try { if (wavesurfer) wavesurfer.load(j.download); } catch(_) {}
+      loadDenoisedBtn.disabled = false;
+    } catch (err) {
+      console.error('Denoise error', err);
+      alert('Denoise failed: ' + (err.message||err));
+      if (statusEl) statusEl.innerText = 'denoise failed';
+    }
+  });
+
+  // Load denoised
+  loadDenoisedBtn.addEventListener('click', async ()=>{
+    if(!currentJob){ alert('Upload first'); return; }
+    const url = `/denoise/job/${currentJob}`;
+    try {
+      const head = await fetch(url, { method: 'HEAD' });
+      if (!head.ok) throw new Error('Not ready');
+      if (wavesurfer) wavesurfer.load(url);
+      if (statusEl) statusEl.innerText = 'Loaded denoised audio';
+    } catch (err) {
+      alert('Denoised file not available yet.');
+    }
+  });
+
+  // Load raw upload
+  loadRawBtn.addEventListener('click', ()=>{
+    if(!currentFileUrl){ alert('No file loaded'); return; }
+    if (wavesurfer) wavesurfer.load(currentFileUrl);
+    if (statusEl) statusEl.innerText = 'Loaded raw upload';
+  });
+
+  // Transcribe
+  transcribeBtn.addEventListener('click', async ()=>{
+    if(!currentJob){ alert('Upload first'); return; }
+    const useD = document.getElementById('use-denoise').checked;
+    const payload = { job_id: currentJob, use_denoise: useD };
+    if (statusEl) statusEl.innerText = 'starting transcription...';
+    const resp = await fetch(API.transcribe, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    });
+    if(!resp.ok){ alert('Transcribe failed: '+resp.statusText); return; }
+    const j = await resp.json();
+    if (statusEl) statusEl.innerText = 'transcribe submitted: '+j.job_id;
+    listenEvents(j.job_id);
+  });
+
+  // Playback controls
+  document.getElementById('play').addEventListener('click', ()=> { try { wavesurfer.play(); } catch(_) {} });
+  document.getElementById('pause').addEventListener('click', ()=> { try { wavesurfer.pause(); } catch(_) {} });
+  document.getElementById('stop').addEventListener('click', ()=> { try { wavesurfer.stop(); } catch(_) {} });
+
+  // Download transcript
+  document.getElementById('download').addEventListener('click', ()=> {
+    if(!currentJob) { alert('No job'); return; }
+    window.location = API.download(currentJob);
+  });
+
+  // Model admin buttons
+  document.getElementById('reload-model').addEventListener('click', async ()=>{
+    if (statusEl) statusEl.innerText = 'reloading model...';
+    const resp = await fetch(API.reload, {method:'POST'});
+    const j = await resp.json();
+    if (statusEl) statusEl.innerText = 'reload: '+JSON.stringify(j);
+  });
+  document.getElementById('switch-model-btn').addEventListener('click', async ()=>{
+    const m = document.getElementById('switch-model').value.trim();
+    if(!m) { alert('enter model name'); return; }
+    if (statusEl) statusEl.innerText = 'switching to '+m;
+    const resp = await fetch(API.switch_model, {method: 'POST', headers:{'content-type':'application/json'}, body: JSON.stringify({model_name:m})});
+    const j = await resp.json();
+    if (statusEl) statusEl.innerText = 'switch: '+JSON.stringify(j);
+  });
+
+  // TTS synth button
+  document.getElementById('tts_synthesize').addEventListener('click', async ()=>{
+    const text = document.getElementById('tts_text').value.trim();
+    if(!text) { alert('Enter text to synthesize'); return; }
+    const model = document.getElementById('tts_model').value.trim() || null;
+    const ttsStatus = document.getElementById('tts_status');
+    ttsStatus.textContent = 'Synthesizing...';
+    document.getElementById('tts_synthesize').disabled = true;
+    try {
+      const resp = await fetch('/synthesize', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({text:text, model:model}) });
+      if(!resp.ok) throw new Error('Synthesis failed: '+resp.status);
+      const ab = await resp.arrayBuffer();
+      const blob = new Blob([ab], { type: 'audio/wav' });
+      const url = URL.createObjectURL(blob);
+      const audioEl = document.getElementById('tts_audio');
+      audioEl.src = url;
+      document.getElementById('tts_download').href = url;
+      document.getElementById('tts_download').style.display = 'inline-block';
+      document.getElementById('tts_play').disabled = false;
+      ttsStatus.textContent = 'Ready';
+    } catch (err) {
+      console.error('TTS error', err);
+      ttsStatus.textContent = 'Error';
+      alert('TTS failed: ' + (err.message || err));
+    } finally {
+      document.getElementById('tts_synthesize').disabled = false;
+    }
+  });
+
+  document.getElementById('tts_play').addEventListener('click', ()=> {
+    try { document.getElementById('tts_audio').play(); } catch(e) { console.warn(e); }
+  });
+
+  // initial metrics
+  refreshMetrics();
+
+}); // end DOMContentLoaded
+</script>
+</body>
+</html>
